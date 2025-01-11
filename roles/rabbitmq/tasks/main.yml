@@ -1,0 +1,200 @@
+- name: Add Team RabbitMQ's main signing key
+  shell: |
+    curl -1sLf "https://keys.openpgp.org/vks/v1/by-fingerprint/0A9AF2115F4687BD29803A206B73A36E6026DFCA" | gpg --dearmor | tee /usr/share/keyrings/com.rabbitmq.team.gpg > /dev/null
+  become: yes
+
+- name: Add Cloudsmith Erlang repository key
+  shell: |
+    curl -1sLf https://github.com/rabbitmq/signing-keys/releases/download/3.0/cloudsmith.rabbitmq-erlang.E495BB49CC4BBE5B.key | gpg --dearmor | tee /usr/share/keyrings/rabbitmq.E495BB49CC4BBE5B.gpg > /dev/null
+  become: yes
+
+- name: Add Cloudsmith RabbitMQ repository key
+  shell: |
+    curl -1sLf https://github.com/rabbitmq/signing-keys/releases/download/3.0/cloudsmith.rabbitmq-server.9F4587F226208342.key | gpg --dearmor | tee /usr/share/keyrings/rabbitmq.9F4587F226208342.gpg > /dev/null
+  become: yes
+
+- name: Add RabbitMQ APT repositories
+  copy:
+    content: |
+      ## Provides modern Erlang/OTP releases from a Cloudsmith mirror
+      deb [arch=amd64 signed-by=/usr/share/keyrings/rabbitmq.E495BB49CC4BBE5B.gpg] https://ppa1.rabbitmq.com/rabbitmq/rabbitmq-erlang/deb/ubuntu jammy main
+      deb-src [signed-by=/usr/share/keyrings/rabbitmq.E495BB49CC4BBE5B.gpg] https://ppa1.rabbitmq.com/rabbitmq/rabbitmq-erlang/deb/ubuntu jammy main
+      deb [arch=amd64 signed-by=/usr/share/keyrings/rabbitmq.E495BB49CC4BBE5B.gpg] https://ppa2.rabbitmq.com/rabbitmq/rabbitmq-erlang/deb/ubuntu jammy main
+      deb-src [signed-by=/usr/share/keyrings/rabbitmq.E495BB49CC4BBE5B.gpg] https://ppa2.rabbitmq.com/rabbitmq/rabbitmq-erlang/deb/ubuntu jammy main
+      ## Provides RabbitMQ from a Cloudsmith mirror
+      deb [arch=amd64 signed-by=/usr/share/keyrings/rabbitmq.9F4587F226208342.gpg] https://ppa1.rabbitmq.com/rabbitmq/rabbitmq-server/deb/ubuntu jammy main
+      deb-src [signed-by=/usr/share/keyrings/rabbitmq.9F4587F226208342.gpg] https://ppa1.rabbitmq.com/rabbitmq/rabbitmq-server/deb/ubuntu jammy main
+      deb [arch=amd64 signed-by=/usr/share/keyrings/rabbitmq.9F4587F226208342.gpg] https://ppa2.rabbitmq.com/rabbitmq/rabbitmq-server/deb/ubuntu jammy main
+      deb-src [signed-by=/usr/share/keyrings/rabbitmq.9F4587F226208342.gpg] https://ppa2.rabbitmq.com/rabbitmq/rabbitmq-server/deb/ubuntu jammy main
+    dest: /etc/apt/sources.list.d/rabbitmq.list
+  become: yes
+
+- name: Update APT cache
+  apt:
+    update_cache: yes
+  become: yes
+
+- name: Install Erlang packages
+  apt:
+    name:
+      - erlang-base
+      - erlang-asn1
+      - erlang-crypto
+      - erlang-eldap
+      - erlang-ftp
+      - erlang-inets
+      - erlang-mnesia
+      - erlang-os-mon
+      - erlang-parsetools
+      - erlang-public-key
+      - erlang-runtime-tools
+      - erlang-snmp
+      - erlang-ssl
+      - erlang-syntax-tools
+      - erlang-tftp
+      - erlang-tools
+      - erlang-xmerl
+    state: present
+  become: yes
+
+
+- name: Install RabbitMQ Server
+  apt:
+    name: rabbitmq-server
+    state: present
+    update_cache: yes
+  become: yes
+
+# Phase 3: System Configuration
+- name: Adjust system limits for RabbitMQ
+  sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: yes
+  loop: "{{ rabbitmq.sysctl | dict2items }}"
+  become: yes
+
+# Phase 4: SSL Configuration
+- name: Ensure RabbitMQ certs directory exists
+  file:
+    path: "{{ rabbitmq.ssl.certs_dir }}"
+    state: directory
+    mode: '0700'
+    owner: rabbitmq
+    group: rabbitmq
+  become: yes
+
+- name: Clean up existing certificates in RabbitMQ certs directory
+  file:
+    path: "{{ item }}"
+    state: absent
+  with_fileglob:
+    - "{{ rabbitmq.ssl.certs_dir }}/*"
+  become: yes
+
+- name: Copy certificates to remote servers
+  copy:
+    src: "{{ playbook_dir }}/files/certs/rabbitmq/{{ item }}"
+    dest: "{{ rabbitmq.ssl.certs_dir }}/{{ item }}"
+    owner: rabbitmq
+    group: rabbitmq
+    mode: '0600'
+  become: yes
+  become_user: root
+  loop: "{{ lookup('fileglob', playbook_dir + '/files/certs/rabbitmq/*', wantlist=True) | map('basename') }}"
+
+# Phase 5: RabbitMQ Base Configuration
+- name: Configure RabbitMQ SSL settings
+  blockinfile:
+    path: /etc/rabbitmq/rabbitmq.conf
+    create: yes
+    block: |
+      # SSL Settings
+      listeners.ssl.default = 5671
+      ssl_options.cacertfile = {{ rabbitmq.ssl.certs_dir }}/ca.crt
+      ssl_options.certfile = {{ rabbitmq.ssl.certs_dir }}/rabbitmq.crt
+      ssl_options.keyfile = {{ rabbitmq.ssl.certs_dir }}/rabbitmq.key
+      ssl_options.verify = verify_peer
+      ssl_options.fail_if_no_peer_cert = true
+  become: yes
+
+- name: Configure RabbitMQ memory high watermark
+  blockinfile:
+    path: /etc/rabbitmq/rabbitmq.conf
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - memory watermark"
+    block: |
+      vm_memory_high_watermark.relative = 0.4
+    create: yes
+  become: yes
+
+- name: Configure RabbitMQ disk free limit
+  blockinfile:
+    path: /etc/rabbitmq/rabbitmq.conf
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - disk limit"
+    block: |
+      disk_free_limit.relative = 0.2
+    create: yes
+  become: yes
+
+# Phase 6: Service Start and Plugin Enable
+- name: Enable RabbitMQ Management Plugin
+  rabbitmq_plugin:
+    names: rabbitmq_management
+    state: enabled
+  become: yes
+
+- name: Ensure RabbitMQ service is started and enabled
+  service:
+    name: rabbitmq-server
+    state: started
+    enabled: yes
+  become: yes
+
+# Phase 7: Add RabbitMQ user to groups
+- name: Add RabbitMQ user to cockroach group
+  user:
+    name: rabbitmq
+    groups: "{{ cockroachdb.group }}"
+    append: yes
+  become: yes
+
+# Phase 8: Wait for RabbitMQ to be fully started
+- name: Wait for RabbitMQ to be ready
+  wait_for:
+    port: 5672
+    delay: 10
+    timeout: 30
+
+# Phase 9: User Management
+- name: Disable the guest user
+  rabbitmq_user:
+    name: guest
+    state: absent
+  become: yes
+
+- name: Create admin user
+  rabbitmq_user:
+    name: "{{ rabbitmq.admin_user }}"
+    password: "{{ vault_rabbitmq_admin_password }}"
+    tags: administrator
+    state: present
+  become: yes
+
+- name: Add RabbitMQ web management user
+  rabbitmq_user:
+    name: "{{ rabbitmq.web_admin_user }}"
+    password: "{{ vault_rabbitmq_web_admin_password}}"
+    tags: administrator
+    state: present
+  become: yes
+
+- name: Set permissions for admin user
+  rabbitmq_user:
+    user: "{{ rabbitmq.admin_user }}"
+    vhost: /
+    configure_priv: "^.*"
+    write_priv: "^.*"
+    read_priv: "^.*"
+    state: present
+  become: yes

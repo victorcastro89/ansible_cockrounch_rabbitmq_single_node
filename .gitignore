@@ -1,0 +1,90 @@
+# Ansible specific
+*.retry
+.vault_pass
+*.pyc
+__pycache__/
+ansible.log
+
+# Environment files
+.env
+.venv/
+venv/
+env/
+ENV/
+
+# Certificates and keys
+files/certs/
+files/cockroach
+files/cockroach.tgz
+*.key
+*.crt
+*.csr
+*.pem
+*.srl
+
+# Vault files
+vault.yml
+**/vault.yml
+# But allow example vault files
+!vault.yml.example
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
+
+# Log files
+*.log
+logs/
+log/
+
+# Temporary files
+tmp/
+.tmp/
+temp/
+.temp/
+
+
+# But allow example hosts file
+!hosts.yml.example
+
+# Compiled files
+*.com
+*.class
+*.dll
+*.exe
+*.o
+*.so
+
+# Packages
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
+# Database files
+*.sqlite
+*.db
+
+# Local configuration
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local

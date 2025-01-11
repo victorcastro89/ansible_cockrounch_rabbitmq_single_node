@@ -1,0 +1,22 @@
+---
+- name: Deploy CockroachDB Single-Node and RabbitMQ
+  hosts: cockroachdb_cluster
+  become: yes
+  collections:
+    - community.rabbitmq
+
+  pre_tasks:
+    - name: Check system requirements
+      assert:
+        that:
+          - ansible_memtotal_mb >= 1024
+          - ansible_processor_vcpus >= 2
+        msg: "System does not meet minimum requirements"
+
+  roles:
+    - common
+    - generate_certs
+    - rabbitmq
+    - cockroachdb
+    - security
+    - startdb

@@ -1,0 +1,712 @@
+#./site.yml
+---
+- name: Deploy CockroachDB Single-Node and RabbitMQ
+  hosts: cockroachdb_cluster
+  become: yes
+  collections:
+    - community.rabbitmq
+
+  pre_tasks:
+    - name: Check system requirements
+      assert:
+        that:
+          - ansible_memtotal_mb >= 1024
+          - ansible_processor_vcpus >= 2
+        msg: "System does not meet minimum requirements"
+
+  roles:
+    - common
+    - generate_certs
+    - rabbitmq
+    - cockroachdb
+    - security
+    - startdb
+
+#./ansible.cfg
+[defaults]
+inventory = ./inventories/production
+roles_path = ./roles
+vault_password_file = ./.vault_pass
+host_key_checking = False
+forks = 10
+
+[ssh_connection]
+pipelining = True
+ssh_args = -o ControlMaster=auto -o ControlPersist=30m
+
+#./.vault_pass
+victor
+
+#./roles/monitoring/tasks/main.yml
+
+
+#./roles/common/templates/templates/ntp.conf.j2
+driftfile /var/lib/ntp/ntp.drift
+
+statistics loopstats peerstats clockstats
+filegen loopstats file loopstats type day enable
+filegen peerstats file peerstats type day enable
+filegen clockstats file clockstats type day enable
+
+server time1.google.com iburst
+server time2.google.com iburst
+server time3.google.com iburst
+server time4.google.com iburst
+
+restrict -4 default kod notrap nomodify nopeer noquery limited
+restrict -6 default kod notrap nomodify nopeer noquery limited
+
+restrict 127.0.0.1
+restrict ::1
+
+#./roles/common/tasks/main.yml
+- name: Update system
+  apt:
+    update_cache: yes
+    upgrade: yes
+
+- name: Install required packages
+  apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - python3-pip
+      - ufw
+      - fail2ban
+      - chrony
+      - acl
+      - logrotate
+      - net-tools
+    state: present
+
+- name: Configure system limits
+  pam_limits:
+    domain: cockroach
+    limit_type: "{{ item.type }}"
+    limit_item: "{{ item.item }}"
+    value: "{{ item.value }}"
+  loop:
+    - { type: soft, item: nofile, value: 65536 }
+    - { type: hard, item: nofile, value: 65536 }
+    - { type: soft, item: nproc, value: 32768 }
+    - { type: hard, item: nproc, value: 32768 }
+
+- name: Configure sysctl
+  sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/60-cockroachdb.conf
+    reload: yes
+  loop:
+    - { name: "vm.swappiness", value: "1" }
+    - { name: "vm.max_map_count", value: "262144" }
+    - { name: "net.core.somaxconn", value: "65535" }
+    - { name: "net.ipv4.tcp_max_syn_backlog", value: "65535" }
+    - { name: "net.ipv4.tcp_syncookies", value: "1" }
+    - { name: "net.ipv4.tcp_fin_timeout", value: "30" }
+
+- name: Create cockroach group
+  group:
+    name: "{{ cockroachdb.group }}"
+    system: yes
+  become: yes
+
+- name: Create cockroach user
+  user:
+    name: "{{ cockroachdb.user }}"
+    group: "{{ cockroachdb.group }}"
+    shell: /bin/false
+    home: "{{ cockroachdb.data_dir }}"
+    create_home: no
+  become: yes
+
+- name: Debug cockroach user
+  command: getent passwd cockroach
+  register: debug_user
+- debug:
+    var: debug_user.stdout
+
+
+#./roles/security/tasks/main.yml
+- name: Configure UFW
+  ufw:
+    rule: allow
+    port: "{{ item.port }}"
+    proto: "{{ item.proto }}"
+    from_ip: "{{ item.from | default(omit) }}"
+  loop:
+    - { port: "{{ cockroachdb.http_port }}", proto: tcp, from: "{{ trusted_networks }}" }
+    - { port: "{{ cockroachdb.sql_port }}", proto: tcp, from: "{{ trusted_networks }}" }
+    - { port: "{{ cockroachdb.cluster_port }}", proto: tcp, from: "{{ trusted_networks }}" }
+    - { port: 22, proto: tcp, from: "{{ admin_networks }}" }
+    - { port: "{{ monitoring.prometheus_port }}", proto: tcp, from: "{{ monitoring_networks }}" }
+    - { port: 5672, proto: tcp, from: "{{ trusted_networks }}" }  # AMQP
+    - { port: 15672, proto: tcp, from: "{{ admin_networks }}" }  # Management UI
+
+#./roles/security/meta/main.yml
+---
+dependencies:
+  - role: common
+
+#./roles/rabbitmq/tasks/main.yml
+- name: Add Team RabbitMQ's main signing key
+  shell: |
+    curl -1sLf "https://keys.openpgp.org/vks/v1/by-fingerprint/0A9AF2115F4687BD29803A206B73A36E6026DFCA" | gpg --dearmor | tee /usr/share/keyrings/com.rabbitmq.team.gpg > /dev/null
+  become: yes
+
+- name: Add Cloudsmith Erlang repository key
+  shell: |
+    curl -1sLf https://github.com/rabbitmq/signing-keys/releases/download/3.0/cloudsmith.rabbitmq-erlang.E495BB49CC4BBE5B.key | gpg --dearmor | tee /usr/share/keyrings/rabbitmq.E495BB49CC4BBE5B.gpg > /dev/null
+  become: yes
+
+- name: Add Cloudsmith RabbitMQ repository key
+  shell: |
+    curl -1sLf https://github.com/rabbitmq/signing-keys/releases/download/3.0/cloudsmith.rabbitmq-server.9F4587F226208342.key | gpg --dearmor | tee /usr/share/keyrings/rabbitmq.9F4587F226208342.gpg > /dev/null
+  become: yes
+
+- name: Add RabbitMQ APT repositories
+  copy:
+    content: |
+      ## Provides modern Erlang/OTP releases from a Cloudsmith mirror
+      deb [arch=amd64 signed-by=/usr/share/keyrings/rabbitmq.E495BB49CC4BBE5B.gpg] https://ppa1.rabbitmq.com/rabbitmq/rabbitmq-erlang/deb/ubuntu jammy main
+      deb-src [signed-by=/usr/share/keyrings/rabbitmq.E495BB49CC4BBE5B.gpg] https://ppa1.rabbitmq.com/rabbitmq/rabbitmq-erlang/deb/ubuntu jammy main
+      deb [arch=amd64 signed-by=/usr/share/keyrings/rabbitmq.E495BB49CC4BBE5B.gpg] https://ppa2.rabbitmq.com/rabbitmq/rabbitmq-erlang/deb/ubuntu jammy main
+      deb-src [signed-by=/usr/share/keyrings/rabbitmq.E495BB49CC4BBE5B.gpg] https://ppa2.rabbitmq.com/rabbitmq/rabbitmq-erlang/deb/ubuntu jammy main
+      ## Provides RabbitMQ from a Cloudsmith mirror
+      deb [arch=amd64 signed-by=/usr/share/keyrings/rabbitmq.9F4587F226208342.gpg] https://ppa1.rabbitmq.com/rabbitmq/rabbitmq-server/deb/ubuntu jammy main
+      deb-src [signed-by=/usr/share/keyrings/rabbitmq.9F4587F226208342.gpg] https://ppa1.rabbitmq.com/rabbitmq/rabbitmq-server/deb/ubuntu jammy main
+      deb [arch=amd64 signed-by=/usr/share/keyrings/rabbitmq.9F4587F226208342.gpg] https://ppa2.rabbitmq.com/rabbitmq/rabbitmq-server/deb/ubuntu jammy main
+      deb-src [signed-by=/usr/share/keyrings/rabbitmq.9F4587F226208342.gpg] https://ppa2.rabbitmq.com/rabbitmq/rabbitmq-server/deb/ubuntu jammy main
+    dest: /etc/apt/sources.list.d/rabbitmq.list
+  become: yes
+
+- name: Update APT cache
+  apt:
+    update_cache: yes
+  become: yes
+
+- name: Install Erlang packages
+  apt:
+    name:
+      - erlang-base
+      - erlang-asn1
+      - erlang-crypto
+      - erlang-eldap
+      - erlang-ftp
+      - erlang-inets
+      - erlang-mnesia
+      - erlang-os-mon
+      - erlang-parsetools
+      - erlang-public-key
+      - erlang-runtime-tools
+      - erlang-snmp
+      - erlang-ssl
+      - erlang-syntax-tools
+      - erlang-tftp
+      - erlang-tools
+      - erlang-xmerl
+    state: present
+  become: yes
+
+
+- name: Install RabbitMQ Server
+  apt:
+    name: rabbitmq-server
+    state: present
+    update_cache: yes
+  become: yes
+
+# Phase 3: System Configuration
+- name: Adjust system limits for RabbitMQ
+  sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: yes
+  loop: "{{ rabbitmq.sysctl | dict2items }}"
+  become: yes
+
+# Phase 4: SSL Configuration
+- name: Ensure RabbitMQ certs directory exists
+  file:
+    path: "{{ rabbitmq.ssl.certs_dir }}"
+    state: directory
+    mode: '0700'
+    owner: rabbitmq
+    group: rabbitmq
+  become: yes
+
+- name: Clean up existing certificates in RabbitMQ certs directory
+  file:
+    path: "{{ item }}"
+    state: absent
+  with_fileglob:
+    - "{{ rabbitmq.ssl.certs_dir }}/*"
+  become: yes
+
+- name: Copy certificates to remote servers
+  copy:
+    src: "{{ playbook_dir }}/files/certs/rabbitmq/{{ item }}"
+    dest: "{{ rabbitmq.ssl.certs_dir }}/{{ item }}"
+    owner: rabbitmq
+    group: rabbitmq
+    mode: '0600'
+  become: yes
+  become_user: root
+  loop: "{{ lookup('fileglob', playbook_dir + '/files/certs/rabbitmq/*', wantlist=True) | map('basename') }}"
+
+# Phase 5: RabbitMQ Base Configuration
+- name: Configure RabbitMQ SSL settings
+  blockinfile:
+    path: /etc/rabbitmq/rabbitmq.conf
+    create: yes
+    block: |
+      # SSL Settings
+      listeners.ssl.default = 5671
+      ssl_options.cacertfile = {{ rabbitmq.ssl.certs_dir }}/ca.crt
+      ssl_options.certfile = {{ rabbitmq.ssl.certs_dir }}/rabbitmq.crt
+      ssl_options.keyfile = {{ rabbitmq.ssl.certs_dir }}/rabbitmq.key
+      ssl_options.verify = verify_peer
+      ssl_options.fail_if_no_peer_cert = true
+  become: yes
+
+- name: Configure RabbitMQ memory high watermark
+  blockinfile:
+    path: /etc/rabbitmq/rabbitmq.conf
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - memory watermark"
+    block: |
+      vm_memory_high_watermark.relative = 0.4
+    create: yes
+  become: yes
+
+- name: Configure RabbitMQ disk free limit
+  blockinfile:
+    path: /etc/rabbitmq/rabbitmq.conf
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - disk limit"
+    block: |
+      disk_free_limit.relative = 0.2
+    create: yes
+  become: yes
+
+# Phase 6: Service Start and Plugin Enable
+- name: Enable RabbitMQ Management Plugin
+  rabbitmq_plugin:
+    names: rabbitmq_management
+    state: enabled
+  become: yes
+
+- name: Ensure RabbitMQ service is started and enabled
+  service:
+    name: rabbitmq-server
+    state: started
+    enabled: yes
+  become: yes
+
+# Phase 7: Add RabbitMQ user to groups
+- name: Add RabbitMQ user to cockroach group
+  user:
+    name: rabbitmq
+    groups: "{{ cockroachdb.group }}"
+    append: yes
+  become: yes
+
+# Phase 8: Wait for RabbitMQ to be fully started
+- name: Wait for RabbitMQ to be ready
+  wait_for:
+    port: 5672
+    delay: 10
+    timeout: 30
+
+# Phase 9: User Management
+- name: Disable the guest user
+  rabbitmq_user:
+    name: guest
+    state: absent
+  become: yes
+
+- name: Create admin user
+  rabbitmq_user:
+    name: "{{ rabbitmq.admin_user }}"
+    password: "{{ vault_rabbitmq_admin_password }}"
+    tags: administrator
+    state: present
+  become: yes
+
+- name: Add RabbitMQ web management user
+  rabbitmq_user:
+    name: "{{ rabbitmq.web_admin_user }}"
+    password: "{{ vault_rabbitmq_web_admin_password}}"
+    tags: administrator
+    state: present
+  become: yes
+
+- name: Set permissions for admin user
+  rabbitmq_user:
+    user: "{{ rabbitmq.admin_user }}"
+    vhost: /
+    configure_priv: "^.*"
+    write_priv: "^.*"
+    read_priv: "^.*"
+    state: present
+  become: yes
+
+#./roles/cockroachdb/tasks/main.yml
+- name: Download CockroachDB binary
+  get_url:
+    url: "https://binaries.cockroachdb.com/cockroach-v{{ cockroachdb.version }}.linux-amd64.tgz"
+    dest: "/tmp/cockroach.tgz"
+    mode: '0644'
+    validate_certs: no
+  become: yes
+  register: download_result
+  retries: 3
+  delay: 5
+  until: download_result is succeeded
+
+- name: Extract CockroachDB
+  unarchive:
+    src: "/tmp/cockroach.tgz"
+    dest: "/usr/local/bin/"
+    remote_src: yes
+    extra_opts: ["--strip-components=1"]
+  become: yes
+  when: download_result
+
+- name: Set cockroach binary permissions
+  file:
+    path: "/usr/local/bin/cockroach"
+    mode: '0755'
+    owner: "{{ cockroachdb.user }}"
+    group: "{{ cockroachdb.group }}"
+  become: yes
+
+- name: Add to system PATH
+  file:
+    src: "/usr/local/bin/cockroach"
+    dest: "/usr/bin/cockroach"
+    state: link
+  become: yes
+
+- name: Ensure certs directory is clean
+  command: rm -rf {{ cockroachdb.certs_dir }}
+  become: yes
+  ignore_errors: yes
+
+- name: Verify certs directory is deleted
+  stat:
+    path: "{{ cockroachdb.certs_dir }}"
+  register: certs_dir_stat
+
+- name: Debug certs directory status
+  debug:
+    var: certs_dir_stat.stat.exists
+
+- name: Recreate certs directory
+  file:
+    path: "{{ cockroachdb.certs_dir }}"
+    state: directory
+    owner: "{{ cockroachdb.user }}"
+    group: "{{ cockroachdb.group }}"
+    mode: '0700'
+  become: yes
+
+- name: Copy certificates to remote servers
+  copy:
+    src: "{{ playbook_dir }}/files/certs/cockroachdb/{{ item }}"
+    dest: "{{ cockroachdb.certs_dir }}/{{ item }}"
+    owner: "{{ cockroachdb.user }}"
+    group: "{{ cockroachdb.group }}"
+    mode: '0600'
+  become: yes
+  loop: "{{ lookup('fileglob', playbook_dir + '/files/certs/cockroachdb/*', wantlist=True) | map('basename') }}"
+
+- name: Ensure certificates are owned by cockroach user
+  file:
+    path: "{{ cockroachdb.certs_dir }}/{{ item }}"
+    owner: "{{ cockroachdb.user }}"
+    group: "{{ cockroachdb.group }}"
+    mode: '0600'
+  become: yes
+  loop: "{{ lookup('fileglob', playbook_dir + '/files/certs/cockroachdb/*', wantlist=True) | map('basename') }}"
+
+
+
+#./roles/cockroachdb/meta/main.yml
+---
+dependencies:
+  - role: common
+
+#./roles/generate_certs/tasks/main.yml
+
+- name: Manage certificate directories and cleanup
+  block:
+    - name: Ensure certificate directories exist
+      become: yes
+      file:
+        path: "{{ playbook_dir }}/files/certs/{{ item }}"
+        state: directory
+        mode: '0700'
+      loop:
+        - cockroachdb
+        - rabbitmq
+
+- name: Clean up existing certificates
+  become: yes
+  become_user: root
+  file:
+    path: "{{ playbook_dir }}/files/certs/{{ item.dir }}/{{ item.file }}"
+    state: absent
+  loop:
+    # CockroachDB certificates
+    - { dir: 'cockroachdb', file: 'ca.crt' }
+    - { dir: 'cockroachdb', file: 'ca.key' }
+    - { dir: 'cockroachdb', file: 'client.root.crt' }
+    - { dir: 'cockroachdb', file: 'client.root.key' }
+    - { dir: 'cockroachdb', file: 'node.crt' }
+    - { dir: 'cockroachdb', file: 'node.key' }
+    # RabbitMQ certificates
+    - { dir: 'rabbitmq', file: 'ca.crt' }
+    - { dir: 'rabbitmq', file: 'ca.key' }
+    - { dir: 'rabbitmq', file: 'rabbitmq.crt' }
+    - { dir: 'rabbitmq', file: 'rabbitmq.key' }
+    - { dir: 'rabbitmq', file: 'rabbitmq.csr' }
+    - { dir: 'rabbitmq', file: 'ca.srl' }
+  delegate_to: localhost
+
+- name: Check if CockroachDB binary exists locally
+  stat:
+    path: "{{ playbook_dir }}/files/cockroach"
+  register: binary_stat
+  delegate_to: localhost
+
+- name: Download CockroachDB binary locally
+  get_url:
+    url: "https://binaries.cockroachdb.com/cockroach-v{{ cockroachdb.version }}.linux-amd64.tgz"
+    dest: "{{ playbook_dir }}/files/cockroach.tgz"
+    mode: '0644'
+    validate_certs: no
+  delegate_to: localhost
+  when: not binary_stat.stat.exists
+
+- name: Extract CockroachDB locallyzz
+  unarchive:
+    src: "{{ playbook_dir }}/files/cockroach.tgz"
+    dest: "{{ playbook_dir }}/files/"
+    remote_src: no
+    extra_opts: ["--strip-components=1"]
+  delegate_to: localhost
+  when: not binary_stat.stat.exists
+
+- name: Make cockroach executable
+  file:
+    path: "{{ playbook_dir }}/files/cockroach"
+    mode: '0755'
+  delegate_to: localhost
+
+- name: Generate SSL certificates locally
+  command: >
+    cockroach cert create-ca \
+    --certs-dir=/home/victor/Desktop/code/commoncrawl/cockrunchdb_single_node_deploy/files/certs/cockroachdb \
+    --ca-key=/home/victor/Desktop/code/commoncrawl/cockrunchdb_single_node_deploy/files/certs/cockroachdb/ca.key
+  delegate_to: localhost
+
+- name: Generate node certificate locally
+  command: >
+    cockroach cert create-node \
+    --certs-dir=/home/victor/Desktop/code/commoncrawl/cockrunchdb_single_node_deploy/files/certs/cockroachdb \
+    --ca-key=/home/victor/Desktop/code/commoncrawl/cockrunchdb_single_node_deploy/files/certs/cockroachdb/ca.key \
+    localhost {{ inventory_hostname }} {{ hostvars[inventory_hostname].ansible_host }}
+  delegate_to: localhost
+  loop: "{{ groups['cockroachdb_cluster'] }}"
+  loop_control:
+    loop_var: inventory_hostname
+
+- name: Generate client certificate for root locally
+  command: >
+    cockroach cert create-client \
+    --certs-dir={{ playbook_dir }}/files/certs/cockroachdb \
+    --ca-key={{ playbook_dir }}/files/certs/cockroachdb/ca.key \
+    root
+  delegate_to: localhost
+
+
+- name: Generate RabbitMQ CA private key
+  command: openssl genrsa -out {{ playbook_dir }}/files/certs/rabbitmq/ca.key 2048
+  delegate_to: localhost
+
+- name: Generate RabbitMQ CA certificate
+  command: >
+    openssl req -x509 -new -nodes 
+    -key {{ playbook_dir }}/files/certs/rabbitmq/ca.key 
+    -sha256 -days 1825 
+    -out {{ playbook_dir }}/files/certs/rabbitmq/ca.crt
+    -subj "/CN=RabbitMQ-CA"
+  delegate_to: localhost
+
+- name: Generate RabbitMQ private key
+  command: openssl genrsa -out {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.key 2048
+  delegate_to: localhost
+
+- name: Generate RabbitMQ CSR
+  command: openssl req -new -key {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.key -out {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.csr -subj "/CN=rabbitmq"
+  delegate_to: localhost
+
+- name: Sign RabbitMQ CSR with CA
+  command: >
+    openssl x509 -req 
+    -in {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.csr 
+    -CA {{ playbook_dir }}/files/certs/rabbitmq/ca.crt 
+    -CAkey {{ playbook_dir }}/files/certs/rabbitmq/ca.key 
+    -CAcreateserial 
+    -out {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.crt 
+    -days 365
+  delegate_to: localhost
+
+- name: Ensure correct permissions for all files in the certs directory
+  file:
+    path: "{{ playbook_dir }}/files/certs/rabbitmq/{{ item }}"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0600'
+  delegate_to: localhost
+  loop: "{{ lookup('fileglob', playbook_dir + '/files/certs/rabbitmq/*', wantlist=True) | map('basename') }}"
+- name: Ensure correct permissions for all files in the certs directory
+  file:
+    path: "{{ playbook_dir }}/files/certs/cockroachdb/{{ item }}"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0600'
+  delegate_to: localhost
+  loop: "{{ lookup('fileglob', playbook_dir + '/files/certs/cockroachdb/*', wantlist=True) | map('basename') }}"
+
+
+#./roles/startdb/tasks/main.yml
+- name: Kill processes on port 8080
+  shell: |
+    netstat -tlpn | grep ':8080' | awk '{print $7}' | cut -d'/' -f1 | xargs -r kill -9
+  become: yes
+  ignore_errors: yes
+
+- name: Force cleanup any remaining CockroachDB processes
+  shell: |
+    pkill -9 cockroach || true
+  become: yes
+  ignore_errors: yes
+
+- name: Wait for ports to be free
+  wait_for:
+    port: "{{ item }}"
+    state: stopped
+    timeout: 30
+  loop:
+    - "{{ cockroachdb.http_port }}"
+    - "{{ cockroachdb.sql_port }}"
+    - "{{ cockroachdb.cluster_port }}"
+
+- name: Ensure directories with proper permissions
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ cockroachdb.user }}"
+    group: "{{ cockroachdb.group }}"
+    mode: '0700'
+    recurse: yes
+  with_items:
+    - "{{ cockroachdb.data_dir }}"
+    - "{{ cockroachdb.log_dir }}"
+  become: yes
+
+- name: Start CockroachDB single-node
+  shell: |
+    cockroach start-single-node \
+    --background \
+    --store={{ cockroachdb.data_dir }} \
+    --listen-addr={{ ansible_host }}:{{ cockroachdb.cluster_port }} \
+    --http-addr={{ ansible_host }}:{{ cockroachdb.http_port }} \
+    --sql-addr={{ ansible_host }}:{{ cockroachdb.sql_port }} \
+    --cache={{ cockroachdb.cache_size }} \
+    --max-sql-memory={{ cockroachdb.max_memory }} \
+    --certs-dir={{ cockroachdb.certs_dir }} \
+    --locality="{{ cockroachdb.locality }}"
+  become: yes
+  register: start_result
+  until: start_result.rc == 0
+  retries: 5
+  delay: 10
+
+#./inventories/production/hosts.yml
+[cockroachdb_cluster]
+node1 ansible_host=192.168.1.160 ansible_ssh_private_key_file=~/.ssh/id_rsa
+
+
+#./inventories/production/group_vars/all/main.yml
+---
+system:
+  swappiness: 1
+  max_file_descriptors: 65536
+  transparent_hugepages: "never"
+  max_map_count: 262144
+  io_scheduler: deadline
+  cpu_governor: performance
+  numa_balancing: 0
+  kernel_shmmax: 68719476736
+  kernel_shmall: 4294967296
+  network_buffers:
+    rmem_max: 16777216
+    wmem_max: 16777216
+    tcp_rmem: "4096 87380 16777216"
+    tcp_wmem: "4096 87380 16777216"
+
+
+
+cockroachdb:
+  version: "24.3.2"  # Latest stable version
+  user: "cockroach"
+  group: "cockroach"
+  data_dir: "/var/lib/cockroachdb"
+  log_dir: "/var/log/cockroachdb"
+  certs_dir: "/var/lib/cockroachdb/certs"
+  http_port: 8080
+  sql_port: 26258
+  cluster_port: 26257
+  max_memory: "25%"  # Use 25% of available memory
+  cache_size: "25%"  # Use 25% of available memory for cache
+  max_disk_temp: "90%"  # Disk usage threshold for temp storage
+  locality: "region=us-east,zone=us-east-1"  # Adjust for your environment
+  security:
+    admin_user: "root"
+    admin_password: "{{ vault_cockroachdb_admin_password }}"
+    ssl:
+      enabled: true  # Enable SSL
+
+rabbitmq:
+  admin_user: "admin"
+  web_admin_user: "web_admin"
+  sysctl:
+    fs.file-max: 500000
+    kernel.msgmnb: 65536
+    kernel.msgmax: 65536
+  ssl:
+    certs_dir: "/var/lib/rabbitmq/certs"
+    certfile: "/var/lib/rabbitmq/certs/rabbitmq.crt"
+    keyfile: "/var/lib/rabbitmq/certs/rabbitmq.key"
+
+monitoring:
+  prometheus_node_exporter: true
+  prometheus_port: 9100
+  grafana_enabled: true
+
+trusted_networks: "192.168.1.0/24"
+admin_networks: "192.168.1.1/24"
+monitoring_networks: "192.168.1.1/24"
+ansible_user: "victor"
+
+
+
+#./inventories/production/group_vars/all/vault.yml
+---
+vault_cockroachdb_admin_password: "cdb"
+vault_rabbitmq_admin_password: "rb"
+vault_rabbitmq_web_admin_password: "rb"

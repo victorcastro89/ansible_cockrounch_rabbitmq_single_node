@@ -1,0 +1,141 @@
+
+- name: Manage certificate directories and cleanup
+  block:
+    - name: Ensure certificate directories exist
+      become: yes
+      file:
+        path: "{{ playbook_dir }}/files/certs/{{ item }}"
+        state: directory
+        mode: '0700'
+      loop:
+        - cockroachdb
+        - rabbitmq
+
+- name: Clean up existing certificates
+  become: yes
+  become_user: root
+  file:
+    path: "{{ playbook_dir }}/files/certs/{{ item.dir }}/{{ item.file }}"
+    state: absent
+  loop:
+    # CockroachDB certificates
+    - { dir: 'cockroachdb', file: 'ca.crt' }
+    - { dir: 'cockroachdb', file: 'ca.key' }
+    - { dir: 'cockroachdb', file: 'client.root.crt' }
+    - { dir: 'cockroachdb', file: 'client.root.key' }
+    - { dir: 'cockroachdb', file: 'node.crt' }
+    - { dir: 'cockroachdb', file: 'node.key' }
+    # RabbitMQ certificates
+    - { dir: 'rabbitmq', file: 'ca.crt' }
+    - { dir: 'rabbitmq', file: 'ca.key' }
+    - { dir: 'rabbitmq', file: 'rabbitmq.crt' }
+    - { dir: 'rabbitmq', file: 'rabbitmq.key' }
+    - { dir: 'rabbitmq', file: 'rabbitmq.csr' }
+    - { dir: 'rabbitmq', file: 'ca.srl' }
+  delegate_to: localhost
+
+- name: Check if CockroachDB binary exists locally
+  stat:
+    path: "{{ playbook_dir }}/files/cockroach"
+  register: binary_stat
+  delegate_to: localhost
+
+- name: Download CockroachDB binary locally
+  get_url:
+    url: "https://binaries.cockroachdb.com/cockroach-v{{ cockroachdb.version }}.linux-amd64.tgz"
+    dest: "{{ playbook_dir }}/files/cockroach.tgz"
+    mode: '0644'
+    validate_certs: no
+  delegate_to: localhost
+  when: not binary_stat.stat.exists
+
+- name: Extract CockroachDB locallyzz
+  unarchive:
+    src: "{{ playbook_dir }}/files/cockroach.tgz"
+    dest: "{{ playbook_dir }}/files/"
+    remote_src: no
+    extra_opts: ["--strip-components=1"]
+  delegate_to: localhost
+  when: not binary_stat.stat.exists
+
+- name: Make cockroach executable
+  file:
+    path: "{{ playbook_dir }}/files/cockroach"
+    mode: '0755'
+  delegate_to: localhost
+
+- name: Generate SSL certificates locally
+  command: >
+    cockroach cert create-ca \
+    --certs-dir=/home/victor/Desktop/code/commoncrawl/cockrunchdb_single_node_deploy/files/certs/cockroachdb \
+    --ca-key=/home/victor/Desktop/code/commoncrawl/cockrunchdb_single_node_deploy/files/certs/cockroachdb/ca.key
+  delegate_to: localhost
+
+- name: Generate node certificate locally
+  command: >
+    cockroach cert create-node \
+    --certs-dir=/home/victor/Desktop/code/commoncrawl/cockrunchdb_single_node_deploy/files/certs/cockroachdb \
+    --ca-key=/home/victor/Desktop/code/commoncrawl/cockrunchdb_single_node_deploy/files/certs/cockroachdb/ca.key \
+    localhost {{ inventory_hostname }} {{ hostvars[inventory_hostname].ansible_host }}
+  delegate_to: localhost
+  loop: "{{ groups['cockroachdb_cluster'] }}"
+  loop_control:
+    loop_var: inventory_hostname
+
+- name: Generate client certificate for root locally
+  command: >
+    cockroach cert create-client \
+    --certs-dir={{ playbook_dir }}/files/certs/cockroachdb \
+    --ca-key={{ playbook_dir }}/files/certs/cockroachdb/ca.key \
+    root
+  delegate_to: localhost
+
+
+- name: Generate RabbitMQ CA private key
+  command: openssl genrsa -out {{ playbook_dir }}/files/certs/rabbitmq/ca.key 2048
+  delegate_to: localhost
+
+- name: Generate RabbitMQ CA certificate
+  command: >
+    openssl req -x509 -new -nodes 
+    -key {{ playbook_dir }}/files/certs/rabbitmq/ca.key 
+    -sha256 -days 1825 
+    -out {{ playbook_dir }}/files/certs/rabbitmq/ca.crt
+    -subj "/CN=RabbitMQ-CA"
+  delegate_to: localhost
+
+- name: Generate RabbitMQ private key
+  command: openssl genrsa -out {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.key 2048
+  delegate_to: localhost
+
+- name: Generate RabbitMQ CSR
+  command: openssl req -new -key {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.key -out {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.csr -subj "/CN=rabbitmq"
+  delegate_to: localhost
+
+- name: Sign RabbitMQ CSR with CA
+  command: >
+    openssl x509 -req 
+    -in {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.csr 
+    -CA {{ playbook_dir }}/files/certs/rabbitmq/ca.crt 
+    -CAkey {{ playbook_dir }}/files/certs/rabbitmq/ca.key 
+    -CAcreateserial 
+    -out {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.crt 
+    -days 365
+  delegate_to: localhost
+
+- name: Ensure correct permissions for all files in the certs directory
+  file:
+    path: "{{ playbook_dir }}/files/certs/rabbitmq/{{ item }}"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0600'
+  delegate_to: localhost
+  loop: "{{ lookup('fileglob', playbook_dir + '/files/certs/rabbitmq/*', wantlist=True) | map('basename') }}"
+- name: Ensure correct permissions for all files in the certs directory
+  file:
+    path: "{{ playbook_dir }}/files/certs/cockroachdb/{{ item }}"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0600'
+  delegate_to: localhost
+  loop: "{{ lookup('fileglob', playbook_dir + '/files/certs/cockroachdb/*', wantlist=True) | map('basename') }}"

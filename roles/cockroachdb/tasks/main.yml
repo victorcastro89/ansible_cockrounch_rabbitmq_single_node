@@ -1,0 +1,78 @@
+- name: Download CockroachDB binary
+  get_url:
+    url: "https://binaries.cockroachdb.com/cockroach-v{{ cockroachdb.version }}.linux-amd64.tgz"
+    dest: "/tmp/cockroach.tgz"
+    mode: '0644'
+    validate_certs: no
+  become: yes
+  register: download_result
+  retries: 3
+  delay: 5
+  until: download_result is succeeded
+
+- name: Extract CockroachDB
+  unarchive:
+    src: "/tmp/cockroach.tgz"
+    dest: "/usr/local/bin/"
+    remote_src: yes
+    extra_opts: ["--strip-components=1"]
+  become: yes
+  when: download_result
+
+- name: Set cockroach binary permissions
+  file:
+    path: "/usr/local/bin/cockroach"
+    mode: '0755'
+    owner: "{{ cockroachdb.user }}"
+    group: "{{ cockroachdb.group }}"
+  become: yes
+
+- name: Add to system PATH
+  file:
+    src: "/usr/local/bin/cockroach"
+    dest: "/usr/bin/cockroach"
+    state: link
+  become: yes
+
+- name: Ensure certs directory is clean
+  command: rm -rf {{ cockroachdb.certs_dir }}
+  become: yes
+  ignore_errors: yes
+
+- name: Verify certs directory is deleted
+  stat:
+    path: "{{ cockroachdb.certs_dir }}"
+  register: certs_dir_stat
+
+- name: Debug certs directory status
+  debug:
+    var: certs_dir_stat.stat.exists
+
+- name: Recreate certs directory
+  file:
+    path: "{{ cockroachdb.certs_dir }}"
+    state: directory
+    owner: "{{ cockroachdb.user }}"
+    group: "{{ cockroachdb.group }}"
+    mode: '0700'
+  become: yes
+
+- name: Copy certificates to remote servers
+  copy:
+    src: "{{ playbook_dir }}/files/certs/cockroachdb/{{ item }}"
+    dest: "{{ cockroachdb.certs_dir }}/{{ item }}"
+    owner: "{{ cockroachdb.user }}"
+    group: "{{ cockroachdb.group }}"
+    mode: '0600'
+  become: yes
+  loop: "{{ lookup('fileglob', playbook_dir + '/files/certs/cockroachdb/*', wantlist=True) | map('basename') }}"
+
+- name: Ensure certificates are owned by cockroach user
+  file:
+    path: "{{ cockroachdb.certs_dir }}/{{ item }}"
+    owner: "{{ cockroachdb.user }}"
+    group: "{{ cockroachdb.group }}"
+    mode: '0600'
+  become: yes
+  loop: "{{ lookup('fileglob', playbook_dir + '/files/certs/cockroachdb/*', wantlist=True) | map('basename') }}"
+
