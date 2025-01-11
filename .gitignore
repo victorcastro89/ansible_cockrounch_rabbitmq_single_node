@@ -13,9 +13,7 @@ env/
 ENV/
 
 # Certificates and keys
-files/certs/
-files/cockroach
-files/cockroach.tgz
+files/
 *.key
 *.crt
 *.csr

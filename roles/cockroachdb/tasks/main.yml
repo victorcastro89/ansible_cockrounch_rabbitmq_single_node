@@ -76,3 +76,36 @@
   become: yes
   loop: "{{ lookup('fileglob', playbook_dir + '/files/certs/cockroachdb/*', wantlist=True) | map('basename') }}"
 
+- name: Verify storage setup
+  block:
+    - name: Check NFS mount points
+      shell: "df -h | grep {{ item }}"
+      register: mount_check
+      loop:
+        - "{{ cockroachdb.data_dir }}"
+        - "{{ cockroachdb.log_dir }}"
+      when: storage.type == "nfs"
+      changed_when: false
+
+    - name: Verify NFS mounts are accessible
+      stat:
+        path: "{{ item }}"
+      register: dir_check
+      loop:
+        - "{{ cockroachdb.data_dir }}"
+        - "{{ cockroachdb.log_dir }}"
+      when: storage.type == "nfs"
+
+
+
+    - name: Verify local directories
+      stat:
+        path: "{{ item }}"
+      register: local_dir_check
+      loop:
+        - "{{ cockroachdb.data_dir }}"
+        - "{{ cockroachdb.log_dir }}"
+      when: storage.type == "local"
+
+
+

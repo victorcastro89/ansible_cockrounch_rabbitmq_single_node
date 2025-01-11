@@ -108,20 +108,50 @@
   command: openssl genrsa -out {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.key 2048
   delegate_to: localhost
 
-- name: Generate RabbitMQ CSR
-  command: openssl req -new -key {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.key -out {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.csr -subj "/CN=rabbitmq"
-  delegate_to: localhost
+- name: Generate RabbitMQ CSR with config file
+  block:
+    - name: Create OpenSSL config file
+      copy:
+        dest: "{{ playbook_dir }}/files/certs/rabbitmq/openssl.cnf"
+        content: |
+          [req]
+          distinguished_name = req_distinguished_name
+          x509_extensions = v3_req
+          prompt = no
+          
+          [req_distinguished_name]
+          CN = rabbitmq
+          
+          [v3_req]
+          subjectAltName = @alt_names
+          
+          [alt_names]
+          DNS.1 = rabbitmq
+          DNS.2 = localhost
+          IP.1 = {{ hostvars[inventory_hostname].ansible_host }}
+          IP.2 = 127.0.0.1
+      delegate_to: localhost
 
-- name: Sign RabbitMQ CSR with CA
-  command: >
-    openssl x509 -req 
-    -in {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.csr 
-    -CA {{ playbook_dir }}/files/certs/rabbitmq/ca.crt 
-    -CAkey {{ playbook_dir }}/files/certs/rabbitmq/ca.key 
-    -CAcreateserial 
-    -out {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.crt 
-    -days 365
-  delegate_to: localhost
+    - name: Generate RabbitMQ CSR with config
+      command: >
+        openssl req -new 
+        -key {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.key 
+        -out {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.csr 
+        -config {{ playbook_dir }}/files/certs/rabbitmq/openssl.cnf
+      delegate_to: localhost
+
+    - name: Sign RabbitMQ CSR with CA using config
+      command: >
+        openssl x509 -req 
+        -in {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.csr 
+        -CA {{ playbook_dir }}/files/certs/rabbitmq/ca.crt 
+        -CAkey {{ playbook_dir }}/files/certs/rabbitmq/ca.key 
+        -CAcreateserial 
+        -out {{ playbook_dir }}/files/certs/rabbitmq/rabbitmq.crt 
+        -days 365
+        -extfile {{ playbook_dir }}/files/certs/rabbitmq/openssl.cnf 
+        -extensions v3_req
+      delegate_to: localhost
 
 - name: Ensure correct permissions for all files in the certs directory
   file:

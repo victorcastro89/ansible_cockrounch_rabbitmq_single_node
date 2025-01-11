@@ -1,3 +1,43 @@
+- name: Configure RabbitMQ storage
+  block:
+    - name: Ensure mount point exists for RabbitMQ NFS
+      file:
+        path: "{{ rabbitmq.data_dir }}"
+        state: directory
+        mode: '0750'
+        owner: rabbitmq
+        group: rabbitmq
+      become: yes
+
+    - name: Install NFS client
+      package:
+        name: "{{ nfs_client_package }}"
+        state: present
+      vars:
+        nfs_client_package: "{{ ansible_os_family | lower | regex_replace('debian', 'nfs-common') | regex_replace('redhat', 'nfs-utils') }}"
+      become: yes
+
+    - name: Mount RabbitMQ NFS share
+      mount:
+        path: "{{ rabbitmq.data_dir }}"
+        src: "{{ storage.nfs.server }}:{{ storage.nfs.export_path }}{{ storage.nfs.rabbitmq_path }}"
+        fstype: nfs
+        opts: "{{ storage.nfs.opts }}"
+        state: mounted
+      become: yes
+
+  when: storage.type == "nfs"
+
+- name: Ensure correct permissions on RabbitMQ data directory
+  file:
+    path: "{{ rabbitmq.data_dir }}"
+    owner: rabbitmq
+    group: rabbitmq
+    mode: '0750'
+    recurse: yes
+  become: yes
+  when: storage.type == "nfs"
+
 - name: Add Team RabbitMQ's main signing key
   shell: |
     curl -1sLf "https://keys.openpgp.org/vks/v1/by-fingerprint/0A9AF2115F4687BD29803A206B73A36E6026DFCA" | gpg --dearmor | tee /usr/share/keyrings/com.rabbitmq.team.gpg > /dev/null
@@ -65,6 +105,17 @@
     update_cache: yes
   become: yes
 
+
+- name: Configure RabbitMQ environment
+  template:
+    src: rabbitmq-env.conf.j2
+    dest: /etc/rabbitmq/rabbitmq-env.conf
+    owner: root
+    group: rabbitmq
+    mode: '0644'
+  become: yes
+  notify: Restart RabbitMQ
+
 # Phase 3: System Configuration
 - name: Adjust system limits for RabbitMQ
   sysctl:
@@ -110,14 +161,25 @@
     path: /etc/rabbitmq/rabbitmq.conf
     create: yes
     block: |
-      # SSL Settings
+      # AMQP Listeners
+      listeners.tcp.default = 5672
       listeners.ssl.default = 5671
-      ssl_options.cacertfile = {{ rabbitmq.ssl.certs_dir }}/ca.crt
-      ssl_options.certfile = {{ rabbitmq.ssl.certs_dir }}/rabbitmq.crt
-      ssl_options.keyfile = {{ rabbitmq.ssl.certs_dir }}/rabbitmq.key
+      
+      # Management listeners
+      management.ssl.port   = 15671
+      management.tcp.port   = 15672
+      
+      # SSL Configuration
       ssl_options.verify = verify_peer
       ssl_options.fail_if_no_peer_cert = true
-  become: yes
+      ssl_options.cacertfile = /var/lib/rabbitmq/certs/ca.crt
+      ssl_options.certfile = /var/lib/rabbitmq/certs/rabbitmq.crt
+      ssl_options.keyfile = /var/lib/rabbitmq/certs/rabbitmq.key
+      
+      # Management SSL Configuration
+      management.ssl.cacertfile = /var/lib/rabbitmq/certs/ca.crt
+      management.ssl.certfile = /var/lib/rabbitmq/certs/rabbitmq.crt
+      management.ssl.keyfile = /var/lib/rabbitmq/certs/rabbitmq.key
 
 - name: Configure RabbitMQ memory high watermark
   blockinfile:

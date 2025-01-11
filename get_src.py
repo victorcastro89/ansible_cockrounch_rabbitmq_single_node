@@ -73,6 +73,10 @@ def save_output(formatted_content, output_file='python_files_content.txt'):
 
 
 if __name__ == '__main__':
+    try:
+        os.remove("python_files_content.txt")
+    except FileNotFoundError:
+        pass
     # Get formatted content starting from current directory
     formatted_content = extract_python_files()
 
