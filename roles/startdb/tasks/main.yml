@@ -50,3 +50,45 @@
   until: start_result.rc == 0
   retries: 5
   delay: 10
+
+- name: Wait for CockroachDB to be ready
+  wait_for:
+    host: "{{ ansible_host }}"
+    port: "{{ cockroachdb.sql_port }}"
+    timeout: 30
+
+
+- name: Creat root password
+  shell: |
+    cockroach sql \
+    --certs-dir={{ cockroachdb.certs_dir }} \
+    --host={{ ansible_host }}:{{ cockroachdb.sql_port }} \
+    -e "ALTER USER root WITH PASSWORD '{{ vault_cockroachdb_admin_password }}';"
+  become: yes
+  register: create_user_result
+  no_log: true
+  ignore_errors: true
+
+- name: Debug output (without sensitive info)
+  debug:
+    msg: "Attempted to create user {{ vault_cockroachdb_admin_user }}. Check connection and permissions."
+  when: create_user_result.rc is defined and create_user_result.rc != 0
+
+
+
+- name: Create database
+  shell: |
+    cockroach sql \
+    --certs-dir={{ cockroachdb.certs_dir }} \
+    --host={{ ansible_host }}:{{ cockroachdb.sql_port }} \
+    -e "CREATE DATABASE IF NOT EXISTS db;"
+  become: yes
+  register: create_db_result
+
+- name: Grant database privileges to admin user
+  shell: |
+    cockroach sql \
+    --certs-dir={{ cockroachdb.certs_dir }} \
+    --host={{ ansible_host }}:{{ cockroachdb.sql_port }} \
+    -e "GRANT ALL ON DATABASE db TO {{ vault_cockroachdb_admin_user }};"
+  become: yes
